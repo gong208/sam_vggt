@@ -113,13 +113,6 @@ scene_images = [
     "vggt/examples/kitchen/images/01.png",
     "vggt/examples/kitchen/images/02.png",
     "vggt/examples/kitchen/images/03.png",
-    "vggt/examples/kitchen/images/04.png",
-    "vggt/examples/kitchen/images/05.png",
-    "vggt/examples/kitchen/images/06.png",
-    "vggt/examples/kitchen/images/07.png",
-    "vggt/examples/kitchen/images/08.png",
-    "vggt/examples/kitchen/images/09.png",
-    "vggt/examples/kitchen/images/10.png",
 ]
 out_dir = "vggt_encoder_viz_kitchen"
 ensure_dir(out_dir)

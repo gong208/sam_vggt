@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List, Dict, Any, Type
+from typing import Optional, Tuple, List, Dict, Any, Type, Union
 
 from segment_anything import sam_model_registry
 from segment_anything.modeling import PromptEncoder, MaskDecoder, TwoWayTransformer
@@ -474,35 +474,53 @@ class SamVGGT(nn.Module):
     
     def fuse_prompts(
         self,
-        sam_sparse: torch.Tensor,
-        vggt_cam: torch.Tensor,
-        prompt_frame_idx: int = 0,
+        sam_sparse: torch.Tensor,        # [1, 7, 256]
+        vggt_cam: torch.Tensor,          # [1, Nframes, 2048]
+        prompt_frame_idx: Union[List[int], torch.Tensor],  # [6], only real points
     ) -> torch.Tensor:
         """
-        Fuse SAM sparse prompts with VGGT camera tokens.
-        
-        Args:
-            sam_sparse: [B, Np, 256] SAM sparse prompt embeddings
-            vggt_cam: [1, N, 2048] VGGT camera tokens
-            prompt_frame_idx: Index of the frame containing the prompts
-        
-        Returns:
-            [B, Np, 256] fused prompt embeddings
+        Fuse only the real point tokens (first len(prompt_frame_idx)) with VGGT camera
+        tokens, leave the last SAM padding token unchanged.
+
+        sam_sparse: [B, Np, 256] (here B=1, Np=7)
+        vggt_cam:   [1, Nframes, 2048]
+        prompt_frame_idx: [N_real] (here N_real=6), frame index per real point
         """
-        B, Np, _ = sam_sparse.shape
-        _, S, C_vggt = vggt_cam.shape
-        
-        # Pick camera token of the frame with prompts and broadcast to all prompts
-        cam_k = vggt_cam[:, prompt_frame_idx:prompt_frame_idx+1, :]  # [1, 1, 2048]
-        cam_per_prompt = cam_k.expand(B, Np, C_vggt)  # [B, Np, 2048]
-        
-        # Concatenate on feature dimension
-        fused_in = torch.cat([sam_sparse, cam_per_prompt], dim=-1)  # [B, Np, 2304]
-        
-        # Apply fusion MLP
-        fused_prompts = self.prompt_fusion_mlp(fused_in)  # [B, Np, 256]
-        
-        return fused_prompts
+        B, Np, D_sam = sam_sparse.shape
+        _, Nframes, D_cam = vggt_cam.shape
+        device = sam_sparse.device
+
+        # Number of real points (exclude SAM's not-a-point token)
+        N_real = len(prompt_frame_idx)
+
+        # Convert frame indices to tensor: [N_real]
+        if isinstance(prompt_frame_idx, list):
+            frame_idx = torch.tensor(prompt_frame_idx, device=device, dtype=torch.long)
+        else:
+            frame_idx = prompt_frame_idx.to(device=device, dtype=torch.long)
+
+        # 1) Take only the real point embeddings: [B, N_real, 256]
+        sam_real = sam_sparse[:, :N_real, :]     # [1, 6, 256]
+
+        # 2) Gather the matching camera token for each real point:
+        #    vggt_cam: [1, Nframes, 2048]
+        #    frame_idx: [N_real], values in [0, Nframes-1]
+        cam_for_points = vggt_cam[:, frame_idx, :]    # [1, 6, 2048]
+
+        # If B > 1 later, expand over batch
+        if B > 1:
+            cam_for_points = cam_for_points.expand(B, -1, -1)  # [B, 6, 2048]
+
+        # 3) Concatenate and fuse: [B, 6, 2304] -> [B, 6, 256]
+        fused_in = torch.cat([sam_real, cam_for_points], dim=-1)  # [1, 6, 2304]
+        fused_real = self.prompt_fusion_mlp(fused_in)             # [1, 6, 256]
+
+        # 4) Put the fused real points back, keep last token untouched
+        fused_prompts = sam_sparse.clone()           # [1, 7, 256]
+        fused_prompts[:, :N_real, :] = fused_real    # first 6 fused, last 1 unchanged
+
+        return fused_prompts   # [1, 7, 256]
+
     
     def concatenate_prompt_embeddings(
         self,
@@ -536,145 +554,15 @@ class SamVGGT(nn.Module):
         
         return concatenated_dense_embeddings, concatenated_dense_pe
     
+
     def forward(
-        self,
-        image_paths: List[str],
-        point_coords: Optional[torch.Tensor] = None,
-        point_labels: Optional[torch.Tensor] = None,
-        boxes: Optional[torch.Tensor] = None,
-        mask_input: Optional[torch.Tensor] = None,
-        prompt_frame_idx: int = 0,
-        multimask_output: bool = True,
-        return_embeddings: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Forward pass for multi-view segmentation.
-        
-        Args:
-            image_paths: List of image file paths
-            point_coords: Point prompts [B, N, 2] in original image coordinates
-            point_labels: Point labels [B, N] (1=foreground, 0=background)
-            boxes: Box prompts [B, 4] in original image coordinates
-            mask_input: Mask prompts [B, 1, H, W]
-            prompt_frame_idx: Index of the frame containing the prompts (default: 0)
-            multimask_output: Whether to return multiple masks
-            return_embeddings: Whether to return intermediate embeddings
-        
-        Returns:
-            Dictionary containing:
-                - masks: [B, C, H, W] predicted masks
-                - iou_predictions: [B, C] mask quality scores
-                - low_res_logits: [B, C, 256, 256] low-resolution logits
-                - (optional) fused_embeddings: [N, 256, 64, 64]
-                - (optional) concatenated_embeddings: [1, 256, 64, 64*N]
-        """
-        num_frames = len(image_paths)
-        
-        # 1. Preprocess images for both encoders
-
-        
-        # Load images as tensors for SAM
-        sam_images = []
-        original_sizes = []
-        for path in image_paths:
-            img_pil = Image.open(path).convert("RGB")
-            original_sizes.append((img_pil.size[1], img_pil.size[0]))  # (H, W)
-            img_np = np.array(img_pil)
-            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float()  # [3, H, W]
-            sam_images.append(img_tensor)
-        
-        # Preprocess for SAM
-        sam_preprocessed, _ = self.preprocess_sam_images(sam_images)  # [N, 3, 1024, 1024]
-        
-        # Preprocess for VGGT
-        vggt_preprocessed = self.preprocess_vggt_images(image_paths)  # [N, 3, 896, 896]
-        
-        # 2. Encode with both encoders
-        sam_feats, sam_interms = self.encode_sam(sam_preprocessed)  # [N, 256, 64, 64]
-        vggt_feats, camera_tokens, _ = self.encode_vggt(vggt_preprocessed)  # [N, 2048, 64, 64], [1, N, 2048]
-        
-        # 3. Fuse embeddings
-        fused_embeddings = self.fuse_embeddings(sam_feats, vggt_feats)  # [N, 256, 64, 64]
-        
-        # 4. Concatenate embeddings spatially
-        concatenated_embeddings = self.concatenate_embeddings_spatially(fused_embeddings)  # [1, 256, 64, 64*N]
-        
-        # 5. Encode prompts using pretrained SAM prompt encoder
-        points = None
-        # Before calling prompt_encoder
-        if point_coords is not None:
-            # point_coords: [B, N, 2] in (x,y) original
-            pc = point_coords.clone().float()  # CPU or same device
-            for b in range(pc.shape[0]):
-                # apply_coords expects [N,2] and mutates in place
-                self.transform.apply_coords(pc[b:b+1], original_sizes[prompt_frame_idx])  # uses the frame of the prompt
-            # SAM expects coords in pixels of the 1024 canvas; also account for preprocess padding if needed
-            points = pc.to(self.device)
-
-        sparse_embeddings, dense_embeddings = self.sam.prompt_encoder(
-            points=(points, point_labels.to(self.device)),
-            boxes=boxes.to(self.device) if boxes is not None else None,
-            masks=mask_input.to(self.device) if mask_input is not None else None,
-        )
-        
-        # 6. Get positional embeddings from pretrained prompt encoder
-        dense_pe = self.sam.prompt_encoder.get_dense_pe()  # [1, 256, 64, 64]
-        
-        # 7. Concatenate dense embeddings and positional embeddings for multi-frame input
-        concatenated_dense_embeddings, concatenated_dense_pe = self.concatenate_prompt_embeddings(
-            dense_embeddings, dense_pe, num_frames
-        )  # [B, 256, 64, 64*N], [1, 256, 64, 64*N]
-        
-        # 8. Fuse sparse prompts with VGGT camera tokens
-        fused_prompts = self.fuse_prompts(
-            sparse_embeddings, 
-            camera_tokens, 
-            prompt_frame_idx
-        )  # [B, Np, 256]
-        
-        # 9. Decode masks
-        low_res_masks, iou_pred = self.sam.mask_decoder(
-            image_embeddings=concatenated_embeddings,
-            image_pe=concatenated_dense_pe,
-            sparse_prompt_embeddings=fused_prompts,
-            dense_prompt_embeddings=concatenated_dense_embeddings,
-            multimask_output=multimask_output,
-        )
-        
-        # 10. Postprocess masks
-        # Get the original size of the first frame (which contains the prompt)
-        original_size = original_sizes[prompt_frame_idx]
-        
-        masks = self.sam.postprocess_masks(
-            low_res_masks,
-            input_size=(sam_preprocessed.shape[-2], sam_preprocessed.shape[-1] * num_frames),
-            original_size=(original_size[0], original_size[1] * num_frames),
-        )
-        masks = masks > self.mask_threshold
-        
-        # 11. Prepare output
-        output = {
-            "masks": masks,
-            "iou_predictions": iou_pred,
-            "low_res_logits": low_res_masks,
-        }
-        
-        if return_embeddings:
-            output["sam_vggt_embeddings"] = concatenated_embeddings
-            output["fused_prompts"] = fused_prompts
-            output["concatenated_dense_embeddings"] = concatenated_dense_embeddings
-            output["concatenated_dense_pe"] = concatenated_dense_pe
-        
-        return output
-
-    def forward_batched(
         self,
         batch_image_paths: List[List[str]],
         point_coords_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i, 2] in original coords
         point_labels_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i]
         boxes_list: Optional[List[torch.Tensor]] = None,         # len B, each [Nb_i, 4] (optional)
         mask_input_list: Optional[List[torch.Tensor]] = None,    # len B, each [1, H', W'] (optional)
-        prompt_frame_idx_list: Optional[List[int]] = None,       # len B, index of frame with prompts
+        point_frame_indices_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i] - frame index for each point
         multimask_output: bool = True,
         return_embeddings: bool = False,
     ) -> List[Dict[str, torch.Tensor]]:
@@ -726,46 +614,42 @@ class SamVGGT(nn.Module):
         # 6) Loop per sample for prompts, decode, postprocess
         outputs: List[Dict[str, torch.Tensor]] = []
         for b in range(B):
-            prompt_k = 0 if prompt_frame_idx_list is None else int(prompt_frame_idx_list[b])
             # (i) concat this sample's frames horizontally: [1,256,64,64*N]
             fused_b = fused_bn[b]                                        # [N,256,64,64]
             concat_embed_b = fused_b.reshape(1, 256, 64, 64 * N)         # [1,256,64,64N]
 
-            # (ii) prompts: map coords to SAM 1024 canvas if given
+            # (ii) prompts: coordinates are already in 1024x1024 (or concatenated) space, no transformation needed
             points_tuple = None
             if point_coords_list is not None and point_labels_list is not None and point_coords_list[b] is not None:
-                pc_t = point_coords_list[b].detach().cpu().float()            # [Np, 2] torch
-                pc_np = pc_t.numpy()                                          # -> numpy
-                pc_np = self.transform.apply_coords(pc_np, original_sizes_bn[b][prompt_k])  # numpy in resized coords
-                pc_1024 = torch.from_numpy(pc_np).to(self.device).unsqueeze(0)              # [1, Np, 2] torch
-                pl_1024 = point_labels_list[b].to(self.device).unsqueeze(0)                 # [1, Np]
+                pc_t = point_coords_list[b].detach().cpu().float()            # [Np, 2] torch - already in 1024x1024 or concatenated space
+                # Skip transformation since coordinates are already scaled
+                pc_1024 = pc_t.to(self.device).unsqueeze(0)                   # [1, Np, 2] torch
+                pl_1024 = point_labels_list[b].to(self.device).unsqueeze(0)   # [1, Np]
                 points_tuple = (pc_1024, pl_1024)
 
-            boxes_b = None
-            if boxes_list is not None and boxes_list[b] is not None:
-                bx = boxes_list[b].clone().float()
-                self.transform.apply_boxes_torch(bx[None, ...], original_sizes_bn[b][prompt_k])
-                boxes_b = bx.to(self.device)[None, ...]  # [1, Nb, 4] or [1,4] depending on your encoder’s API
-
-            mask_in_b = None
-            if mask_input_list is not None and mask_input_list[b] is not None:
-                mask_in_b = mask_input_list[b].to(self.device)[None, ...]  # [1,1,H',W']
 
             # (iii) SAM prompt encoder (per-sample)
             sparse_e, dense_e = self.sam.prompt_encoder(
                 points=points_tuple,
-                boxes=boxes_b,
-                masks=mask_in_b,
+                boxes=None,
+                masks=None,
             )  # sparse: [1,Np,256], dense: [1,256,64,64]
 
             # (iv) tile dense & PE along width for N frames
             dense_e_cat = dense_e.repeat(1, 1, 1, N)        # [1,256,64,64N]
             dense_pe_cat = dense_pe_1.repeat(1, 1, 1, N)    # [1,256,64,64N]
 
-            # (v) fuse sparse prompts with this sample’s camera token of prompt frame
+            # (v) fuse sparse prompts with camera tokens - each point fuses with its corresponding frame's camera token
             cam_b = cam_tokens_bn[b:b+1]  # [1,N,2048]
-            fused_prompts_b = self.fuse_prompts(sparse_e, cam_b, prompt_frame_idx=prompt_k)  # [1,Np,256]
+            # Get per-point frame indices
+            if point_frame_indices_list is not None and point_frame_indices_list[b] is not None:
+                per_point_frame_indices = point_frame_indices_list[b].tolist()  # [Np] list of frame indices
 
+            fused_prompts_b = self.fuse_prompts(sparse_e, cam_b, prompt_frame_idx=per_point_frame_indices)  # [1,Np,256]
+            print(concat_embed_b.shape)
+            print(dense_pe_cat.shape)
+            print(fused_prompts_b.shape)
+            print(dense_e_cat.shape)
             # (vi) decode masks for this sample
             low_res_masks_b, iou_pred_b = self.sam.mask_decoder(
                 image_embeddings=concat_embed_b,         # [1,256,64,64N]
@@ -775,7 +659,7 @@ class SamVGGT(nn.Module):
                 multimask_output=multimask_output,
             )
             # (vii) postprocess back to the prompt frame’s original size (wide canvas)
-            H0, W0 = original_sizes_bn[b][prompt_k]
+            H0, W0 = original_sizes_bn[b][0]
             masks_b = self.sam.postprocess_masks(
                 low_res_masks_b,
                 input_size=(sam_pre.shape[-2], sam_pre.shape[-1] * N),          # (1024, 1024*N)

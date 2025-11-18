@@ -4,8 +4,13 @@ import numpy as np
 from PIL import Image
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from segment_anything.modeling import MaskDecoder, TwoWayTransformer
+import shutil
+import tempfile
+from torchvision import transforms
+from sam_vggt_model import SamVGGT, build_sam_vggt
+from utils.dataloader import get_im_gt_name_dict, create_dataloaders, RandomHFlip, LargeScaleJitter
 # ---- helpers: losses ----
 def dice_loss_from_logits(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0) -> torch.Tensor:
     # logits [B,H,W] or [1,H,W]; target [B,1,H,W] or [1,1,H,W] or [B,H,W]
@@ -202,7 +207,7 @@ def train_sam_vggt(
             k_list = batch["prompt_frame_idx"].tolist()
             pc_list = batch["point_coords_list"]
             pl_list = batch["point_labels_list"]
-
+                
             optim.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=amp):
@@ -263,7 +268,7 @@ def train_sam_vggt(
                         if "iou_predictions" in out_b:
                             iou_pred = out_b["iou_predictions"]  # [1,C]
                             with torch.no_grad():
-                                # recompute IoUs at low-res tile (to match iou head’s granularity)
+                                # recompute IoUs at low-res tile (to match iou head's granularity)
                                 ious_target = tile_iou_from_logits(logits_tile, gt_t).unsqueeze(0)  # [1,C]
                             iou_loss_b = iou_loss_b + F.mse_loss(iou_pred, ious_target)
 
@@ -291,8 +296,445 @@ def train_sam_vggt(
 
         print(f"==> epoch {ep} done.")
 
+
+# ---- Helper function to create non-distributed dataloader ----
+def create_dataloader_non_distributed(name_im_gt_list, my_transforms=[], batch_size=1):
+    """
+    Create a dataloader without distributed sampling (for single-GPU training).
+    Similar to create_dataloaders but without DistributedSampler.
+    """
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'sam-hq', 'train'))
+    from utils.dataloader import OnlineDataset
+    
+    if len(name_im_gt_list) == 0:
+        return None, None
+    
+    num_workers_ = 1
+    if batch_size > 1:
+        num_workers_ = 2
+    if batch_size > 4:
+        num_workers_ = 4
+    if batch_size > 8:
+        num_workers_ = 8
+    
+    gos_datasets = []
+    for i in range(len(name_im_gt_list)):
+        gos_dataset = OnlineDataset([name_im_gt_list[i]], transform=transforms.Compose(my_transforms))
+        gos_datasets.append(gos_dataset)
+    
+    gos_dataset = ConcatDataset(gos_datasets)
+    dataloader = DataLoader(
+        gos_dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        drop_last=True, 
+        num_workers=num_workers_
+    )
+    
+    return dataloader, gos_dataset
+
+
+# ---- Distributed training setup helper ----
+def init_distributed_training():
+    """
+    Initialize distributed training. Returns rank, world_size, local_rank, and device.
+    """
+    import torch.distributed as dist
+    
+    # Check if distributed is already initialized
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    else:
+        # Try to get from environment (set by torchrun or torch.distributed.launch)
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            rank = int(os.environ['RANK'])
+            world_size = int(os.environ['WORLD_SIZE'])
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            
+            # Initialize process group
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+            )
+        else:
+            # Single GPU mode
+            rank = 0
+            world_size = 1
+            local_rank = 0
+            return rank, world_size, local_rank, torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Set device
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
+    
+    return rank, world_size, local_rank, device
+
+
+# ---- New training loop for SAM-VGGT with 4 continuous images ----
+def train_sam_vggt_continuous(
+    model,
+    train_dataloader,
+    optimizer,
+    device: str = "cuda",
+    num_frames: int = 4,
+    amp: bool = True,
+    distributed: bool = False,
+):
+    """
+    Training loop for SAM-VGGT that:
+    - Loads 4 continuous images from dataset per batch
+    - Generates point prompts randomly from any of the 4 images
+    - Adjusts point coordinates for concatenated layout
+    - Feeds to model (no regression loss computation here)
+    
+    Args:
+        model: SamVGGT model (should be wrapped with DDP if distributed=True)
+        train_dataloader: DataLoader (should use DistributedSampler if distributed=True)
+        optimizer: Optimizer
+        device: Device string or torch.device
+        num_frames: Number of continuous images per batch (default: 4)
+        amp: Use mixed precision training
+        distributed: Whether using distributed training
+    """
+    import sys
+    import os
+    sys.path.append(os.path.join(os.path.dirname(__file__), 'sam-hq', 'train'))
+    from utils.misc import masks_sample_points
+    import random
+    import tempfile
+    
+    # model.train()
+    
+    # Set epoch for DistributedSampler if using distributed training
+    if distributed and hasattr(train_dataloader.sampler, 'set_epoch'):
+        # This should be set at the beginning of each epoch
+        pass  # Will be set by caller
+    
+    for data in train_dataloader:
+        # data['image']: [B, C, 1024, 1024] - single image per sample
+        # data['label']: [B, 1, 1024, 1024] - single mask per sample
+        # We need to group 4 consecutive samples into one batch
+        
+        inputs = data['image']  # [B, C, 1024, 1024]
+        labels = data['label']  # [B, 1, 1024, 1024]
+        print(inputs.shape)
+        print(labels.shape)
+        # Get image paths if available in dataset
+        im_paths = data.get('ori_im_path', None)
+        if im_paths is None:
+            # Fallback: need to get paths from dataset indices
+            im_paths = [None] * inputs.shape[0]
+        
+        if torch.cuda.is_available():
+            inputs = inputs.cuda()
+            labels = labels.cuda()
+        
+        batch_size = inputs.shape[0]
+        
+        # Process in groups of num_frames (4)
+        for group_start in range(0, batch_size, num_frames):
+            group_end = min(group_start + num_frames, batch_size)
+            if group_end - group_start < num_frames:
+                break  # Skip incomplete groups
+            
+            # Extract 4 continuous images and labels
+            group_inputs = inputs[group_start:group_end]  # [4, C, 1024, 1024]
+            group_labels = labels[group_start:group_end]  # [4, 1, 1024, 1024]
+            
+            # Convert images to numpy for saving/loading
+            imgs_np = group_inputs.permute(0, 2, 3, 1).cpu().numpy().astype(np.uint8)  # [4, 1024, 1024, C]
+            
+            # Generate point prompts randomly from any of the 4 images
+            # Each frame gets exactly 2 points
+            all_point_coords = []
+            all_point_labels = []
+            point_frame_indices = []  # Track which frame each point belongs to
+            
+            # Randomly select which frame(s) to sample points from
+            # Sample points from 1-4 random frames, each with 2 points
+            num_prompt_frames = random.randint(1, num_frames)
+            prompt_frame_indices = random.sample(range(num_frames), num_prompt_frames)
+            # order the prompt_frame_indices from small to large
+            prompt_frame_indices.sort()
+            for frame_idx in prompt_frame_indices:
+                try:
+                    # Sample points from this frame's mask
+                    frame_labels = group_labels[frame_idx:frame_idx+1, 0, :, :]  # [1, 1024, 1024]
+                    frame_points = masks_sample_points(frame_labels, k=2)  # [1, 2, 2]
+                    
+                    # Remove batch dimension: [1, 2, 2] -> [2, 2]
+                    frame_points = frame_points.squeeze(0)  # [2, 2]
+                    num_pts = frame_points.shape[0]
+
+                    if num_pts == 0:
+                        # No points sampled; skip this frame
+                        continue
+                    all_point_coords.append(frame_points)
+                    all_point_labels.append(
+                        torch.ones(num_pts, device=frame_points.device, dtype=torch.long)
+                    )
+                    point_frame_indices.extend([frame_idx] * num_pts)
+                    
+                except:
+                    # Skip if not enough points
+                    continue
+            
+            if len(all_point_coords) == 0:
+                continue  # Skip if no valid points
+            
+            # Concatenate all points
+            point_coords_concat = torch.cat(all_point_coords, dim=0)  # [N_points, 2]
+            point_labels_concat = torch.cat(all_point_labels, dim=0)  # [N_points]
+            point_frame_indices = torch.tensor(point_frame_indices, dtype=torch.long)  # [N_points]
+
+            # Save images to temporary files for model to load
+            # Model expects image paths, so we create temp files
+            temp_dir = tempfile.mkdtemp()
+            image_paths = []
+            original_sizes = []
+            
+            for i in range(num_frames):
+                # Save image to temp file
+                temp_path = os.path.join(temp_dir, f"frame_{i}.png")
+                img_pil = Image.fromarray(imgs_np[i])
+                img_pil.save(temp_path)
+                image_paths.append(temp_path)
+                original_sizes.append((1024, 1024))  # After LargeScaleJitter, all are 1024x1024
+            
+            # Prepare point coords and labels for model
+            point_coords_list = [point_coords_concat.cpu()]  # [N_points, 2] in concatenated coords
+            point_labels_list = [point_labels_concat.cpu()]  # [N_points]
+            point_frame_indices_list = [point_frame_indices.cpu()]  # [N_points] - frame index for each point
+
+            # Feed to model
+            with torch.cuda.amp.autocast(enabled=amp):
+                # Model forward - coordinates are already in concatenated space
+                outputs = model.forward(
+                    batch_image_paths=[image_paths],
+                    point_coords_list=point_coords_list,
+                    point_labels_list=point_labels_list,
+                    point_frame_indices_list=point_frame_indices_list,  # Per-point frame indices
+                    multimask_output=False,
+                    return_embeddings=False,
+                )
+            
+            # Clean up temp files
+            shutil.rmtree(temp_dir)
+            
+            # TODO: Add loss computation and backward pass here
+            # For now, just the data loading and model forward is done
+
 # ----------------- usage sketch -----------------
 # model = build_sam_vggt(...);   # your SamVGGT with forward_batched(...)
 # train_set = HypersimSceneDataset(root="/path/to/hypersim", scenes=train_scenes, N=3)
 # train_loader = DataLoader(train_set, batch_size=4, shuffle=True, num_workers=8, collate_fn=collate_scenes, drop_last=True)
 # train_sam_vggt(model, train_loader, epochs=12, lr=1e-4, multimask_output=True)
+
+
+
+def main():
+    # 1. Define your datasets (same format as SAM training)
+    train_datasets = [
+        {
+            "name": "Dataset1",
+            "im_dir": "./ai_001_001_00/color",
+            "gt_dir": "./ai_001_001_00/instance",
+            "im_ext": ".jpg",
+            "gt_ext": ".png"
+        },
+        {
+            "name": "Dataset2",
+            "im_dir": "./ai_017_003_00/color",
+            "gt_dir": "./ai_017_003_00/instance",
+            "im_ext": ".jpg",
+            "gt_ext": ".png"
+        },
+        {
+            "name": "Dataset3",
+            "im_dir": "./ai_018_009_01/color",
+            "gt_dir": "./ai_018_009_01/instance",
+            "im_ext": ".jpg",
+            "gt_ext": ".png"
+        },
+        # Add more datasets as needed
+    ]
+    
+    # 2. Create dataloader (non-distributed version for single-GPU training)
+    train_im_gt_list = get_im_gt_name_dict(train_datasets, flag="train")
+    train_dataloader, _ = create_dataloader_non_distributed(
+        train_im_gt_list,
+        my_transforms=[
+            RandomHFlip(),
+            LargeScaleJitter()  # Outputs 1024x1024 images
+        ],
+        batch_size=8  # Should be multiple of 4 (or num_frames)
+    )
+    
+    # 3. Initialize your model
+    model = build_sam_vggt()  # Your model initialization
+    # model = None
+    # 4. Set up optimizer
+    # 1. Freeze encoders
+    for p in model.sam.image_encoder.parameters():
+        p.requires_grad = False
+
+    for p in model.vggt.parameters():
+        p.requires_grad = False
+
+    for p in model.sam.prompt_encoder.parameters():
+        p.requires_grad = False
+
+    # 2. Train your fusion modules
+    for p in model.embedding_fusion_mlp.parameters():
+        p.requires_grad = True
+
+    for p in model.prompt_fusion_mlp.parameters():
+        p.requires_grad = True
+
+    # 3. Freeze entire decoder first
+    for p in model.sam.mask_decoder.parameters():
+        p.requires_grad = False
+
+    # 4. UNFREEZE ONLY the small "heads" inside the decoder
+    #    (A) Hypernetwork MLPs (predict per-mask dynamic filters)
+    for mlp in model.sam.mask_decoder.output_hypernetworks_mlps:
+        for p in mlp.parameters():
+            p.requires_grad = True
+
+    #    (B) IoU prediction head
+    for p in model.sam.mask_decoder.iou_prediction_head.parameters():
+        p.requires_grad = True
+
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.0)
+    # optimizer = None
+    # 5. Set device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    
+    # 6. Call the training function
+    train_sam_vggt_continuous(
+        model=model,
+        train_dataloader=train_dataloader,
+        optimizer=optimizer,
+        device=device,
+        num_frames=4,  # Number of continuous images per batch
+        amp=True  # Use mixed precision
+    )
+    
+    print("Training completed!")
+
+
+def main_distributed():
+    """
+    Main function for distributed training with multiple GPUs.
+    Launch with: torchrun --nproc_per_node=3 trainer.py
+    Or: python -m torch.distributed.launch --nproc_per_node=3 trainer.py
+    """
+    # 1. Initialize distributed training
+    rank, world_size, local_rank, device = init_distributed_training()
+    is_main_process = (rank == 0)
+    
+    if is_main_process:
+        print(f"Distributed training: world_size={world_size}, rank={rank}, local_rank={local_rank}")
+    
+    # 2. Define datasets
+    train_datasets = [
+        {
+            "name": "Dataset1",
+            "im_dir": "./ai_001_001_00/color",
+            "gt_dir": "./ai_001_001_00/instance",
+            "im_ext": ".jpg",
+            "gt_ext": ".png"
+        },
+        # Add more datasets...
+    ]
+    
+    # 3. Create distributed dataloader (uses DistributedSampler)
+    train_im_gt_list = get_im_gt_name_dict(train_datasets, flag="train")
+    train_dataloader, _ = create_dataloaders(
+        train_im_gt_list,
+        my_transforms=[
+            RandomHFlip(),
+            LargeScaleJitter()
+        ],
+        batch_size=8,  # Per GPU batch size (total = batch_size * world_size)
+        training=True  # This will use DistributedSampler
+    )
+    
+    # 4. Initialize model
+    # model = build_sam_vggt()  # Your model initialization
+    # model = model.to(device)
+    model = None
+    # 5. Wrap model with DistributedDataParallel
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[local_rank],
+        find_unused_parameters=True  # Set to False if all parameters are used
+    )
+    model_without_ddp = model.module  # Access underlying model
+    
+    # 6. Set up optimizer (use model_without_ddp for optimizer)
+    # Freeze encoders, train fusion MLPs and decoder
+    for p in model_without_ddp.sam.image_encoder.parameters():
+        p.requires_grad = False
+    for p in model_without_ddp.vggt.parameters():
+        p.requires_grad = False
+    for p in model_without_ddp.sam.prompt_encoder.parameters():
+        p.requires_grad = False
+    
+    for p in model_without_ddp.embedding_fusion_mlp.parameters():
+        p.requires_grad = True
+    for p in model_without_ddp.prompt_fusion_mlp.parameters():
+        p.requires_grad = True
+    for p in model_without_ddp.sam.mask_decoder.parameters():
+        p.requires_grad = True
+    
+    trainable_params = [p for p in model_without_ddp.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.0)
+    
+    # 7. Training loop with epochs
+    num_epochs = 10
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    
+    for epoch in range(num_epochs):
+        if is_main_process:
+            print(f"Epoch {epoch+1}/{num_epochs}")
+        
+        # Set epoch for DistributedSampler (important for shuffling)
+        if hasattr(train_dataloader.sampler, 'set_epoch'):
+            train_dataloader.sampler.set_epoch(epoch)
+        
+        # Train for one epoch
+        train_sam_vggt_continuous(
+            model=model,
+            train_dataloader=train_dataloader,
+            optimizer=optimizer,
+            device=device,
+            num_frames=4,
+            amp=True,
+            distributed=True
+        )
+        
+        # Add validation, checkpointing, etc. here
+        if is_main_process:
+            print(f"Epoch {epoch+1} completed")
+    
+    # Cleanup
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    # Check if running in distributed mode
+    # if 'RANK' in os.environ or 'WORLD_SIZE' in os.environ:
+    #     main_distributed()
+    # else:
+    main()  # Single GPU mode
+
