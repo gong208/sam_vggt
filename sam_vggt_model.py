@@ -646,10 +646,7 @@ class SamVGGT(nn.Module):
                 per_point_frame_indices = point_frame_indices_list[b].tolist()  # [Np] list of frame indices
 
             fused_prompts_b = self.fuse_prompts(sparse_e, cam_b, prompt_frame_idx=per_point_frame_indices)  # [1,Np,256]
-            print(concat_embed_b.shape)
-            print(dense_pe_cat.shape)
-            print(fused_prompts_b.shape)
-            print(dense_e_cat.shape)
+
             # (vi) decode masks for this sample
             low_res_masks_b, iou_pred_b = self.sam.mask_decoder(
                 image_embeddings=concat_embed_b,         # [1,256,64,64N]
