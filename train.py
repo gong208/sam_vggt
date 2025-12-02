@@ -20,10 +20,11 @@ point_labels_list = [
 ]
 prompt_frame_idx_list = [0, 2]  # prompts belong to frame 0 for sample 0, frame 2 for sample 1
 
-outs = model.forward_batched(
+outs = model.forward(
     batch_image_paths=batch_paths,
-    point_coords_list=point_coords_list,
-    point_labels_list=point_labels_list,
-    prompt_frame_idx_list=prompt_frame_idx_list,
-    multimask_output=True,
+    point_coords_list=[point_coords_list],
+    point_labels_list=[point_labels_list],
+    point_frame_indices_list=[prompt_frame_idx_list],
+    multimask_output=False,
+    return_embeddings=False,
 )

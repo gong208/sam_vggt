@@ -169,7 +169,6 @@ def train_sam_vggt(
         for batch_idx, data in enumerate(train_dataloader):
             # data['image']: [B, C, 1024, 1024] - single image per sample
             # data['label']: [B, 1, 1024, 1024] - single mask per sample
-            # We need to group 4 consecutive samples into one batch
             
             inputs = data['image']  # [B, C, 1024, 1024]
             labels = data['label']  # [B, 1, 1024, 1024]
