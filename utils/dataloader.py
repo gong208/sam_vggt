@@ -270,3 +270,196 @@ class OnlineDataset(Dataset):
             sample['ori_gt_path'] = self.dataset["gt_path"][idx]
 
         return sample
+
+import os
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+from skimage import io
+
+class MultiSceneImageDataset(Dataset):
+    """
+    Dataset that returns ONE image + mask at a time.
+    Scene grouping is handled externally by the sampler.
+    """
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+
+        self.items = []   # flat list of image entries
+        self.scenes = {}  # scene_id -> list of indices in self.items
+
+        scene_dirs = sorted(os.listdir(root_dir))
+        scene_idx = 0
+
+        for scene_name in scene_dirs:
+            scene_path = os.path.join(root_dir, scene_name)
+            if not os.path.isdir(scene_path):
+                continue
+
+            color_dir = os.path.join(scene_path, "color")
+            inst_dir  = os.path.join(scene_path, "instance")
+
+            color_files = sorted(os.listdir(color_dir))
+            inst_files  = sorted(os.listdir(inst_dir))
+
+            assert len(color_files) == len(inst_files), \
+                f"Scene {scene_name}: mismatching image and mask count"
+
+            self.scenes[scene_idx] = []
+
+            for i, (im_name, gt_name) in enumerate(zip(color_files, inst_files)):
+                im_path = os.path.join(color_dir, im_name)
+                gt_path = os.path.join(inst_dir, gt_name)
+
+                self.items.append({
+                    "image_path": im_path,
+                    "label_path": gt_path,
+                    "scene_id": scene_idx,
+                })
+                self.scenes[scene_idx].append(len(self.items) - 1)
+
+            scene_idx += 1
+
+        print(f"[Dataset] Loaded {len(self.items)} images across {len(self.scenes)} scenes.")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        entry = self.items[index]
+
+        # load image
+        im = io.imread(entry["image_path"])
+        if im.ndim == 2:
+            im = np.repeat(im[:, :, None], 3, axis=2)
+        if im.shape[2] == 1:
+            im = np.repeat(im, 3, axis=2)
+
+        # load instance mask
+        mask = io.imread(entry["label_path"])
+        if mask.ndim > 2:
+            mask = mask[:, :, 0]  # instance_id is stored in the first channel
+
+        im = torch.tensor(im, dtype=torch.float32).permute(2, 0, 1)
+        mask = torch.tensor(mask, dtype=torch.int32).unsqueeze(0)
+
+        sample = {
+            "image": im,
+            "label": mask,
+            "scene_id": entry["scene_id"],
+            "index": index,
+        }
+
+        if self.transform:
+            sample = self.transform(sample)
+
+        return sample
+
+
+import random
+from torch.utils.data import Sampler
+
+class SceneGroupSampler(Sampler):
+    """
+    Returns groups of num_frames indices per iteration.
+    Ensures all indices in a group come from the same scene.
+    """
+
+    def __init__(self, dataset, num_frames=8, shuffle=True):
+        self.dataset = dataset
+        self.num_frames = num_frames
+        self.shuffle = shuffle
+
+        # Precompute groups of size num_frames for each scene
+        self.groups = []
+
+        for scene_id, indices in dataset.scenes.items():
+            if len(indices) < num_frames:
+                continue
+
+            indices = list(indices)
+
+            if shuffle:
+                random.shuffle(indices)
+
+            # sequential groups of num_frames
+            for i in range(0, len(indices) - num_frames + 1, num_frames):
+                self.groups.append(indices[i:i + num_frames])
+
+        print(f"[Sampler] Created {len(self.groups)} groups with size {num_frames}")
+
+    def __len__(self):
+        return len(self.groups)
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.groups)
+
+        for g in self.groups:
+            yield g
+
+class SceneBatchSampler(Sampler):
+    def __init__(self, dataset, batch_size, num_frames=8, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size      # number of groups per batch
+        self.num_frames = num_frames      # views per group
+        self.shuffle = shuffle
+
+        # Precompute all groups
+        self.groups = []
+        for scene_id, indices in dataset.scenes.items():
+            if len(indices) < num_frames:
+                continue
+
+            idxs = list(indices)
+            if shuffle:
+                random.shuffle(idxs)
+
+            # break scene into groups of num_frames
+            for i in range(0, len(idxs) - num_frames + 1, num_frames):
+                self.groups.append(idxs[i:i + num_frames])
+
+        print(f"[Sampler] Total groups = {len(self.groups)}")
+
+    def __len__(self):
+        return len(self.groups) // self.batch_size
+
+    def __iter__(self):
+        groups = self.groups.copy()
+        if self.shuffle:
+            random.shuffle(groups)
+
+        # now produce batches of groups
+        for i in range(0, len(groups), self.batch_size):
+            batch_groups = groups[i:i + self.batch_size]
+
+            if len(batch_groups) < self.batch_size:
+                break  # drop last incomplete batch
+
+            # flatten indices
+            flat = [idx for g in batch_groups for idx in g]
+
+            yield flat  # DataLoader sees the whole batch
+
+
+
+def multiview_collate(batch):
+    """
+    batch: list of size BATCH_SIZE, each element is a list of size num_frames
+    """
+    # flatten: batch becomes list of samples
+    # PyTorch gives us one group at a time, so batch = [sample0, ... sample7]
+
+    images = torch.stack([item["image"] for item in batch], dim=0)
+    labels = torch.stack([item["label"] for item in batch], dim=0)
+    scene_ids = [item["scene_id"] for item in batch]
+
+    return {
+        "images": images,  # [8, 3, H, W]
+        "labels": labels,  # [8, 1, H, W]
+        "scene_id": scene_ids[0],  # all same
+    }
+
+
+
