@@ -386,7 +386,6 @@ class SamVGGT(nn.Module):
     def forward(
         self,
         sam_pre: torch.Tensor,      # [B,N,3,1024,1024]
-        vggt_pre: torch.Tensor,     # [B,N,3,896,896]
         point_coords_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i, 2] in original coords
         point_labels_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i]
         point_frame_indices_list: Optional[List[torch.Tensor]] = None,  # len B, each [Np_i] - frame index for each point
@@ -401,8 +400,22 @@ class SamVGGT(nn.Module):
         Returns:
             A list (len B) of dicts with keys: masks, iou_predictions, low_res_logits, (optional embeddings...)
         """
-        B, N, _, H, W = sam_pre.shape
-        # 4) Encode with SAM and VGGT in batch
+        B, N, C, H, W = sam_pre.shape
+
+        # Flatten batch + frames together
+        sam_flat = sam_pre.reshape(B * N, C, H, W)
+
+        # Resize spatial dimensions
+        vggt_flat = F.interpolate(
+            sam_flat,
+            size=(896, 896),
+            mode="bicubic",
+            align_corners=False
+        )
+
+        # Restore multi-view shape
+        vggt_pre = vggt_flat.reshape(B, N, C, 896, 896)
+
         sam_feats_bn, sam_interms = self.encode_sam_batched(sam_pre)                      # [B,N,256,64,64]
         vggt_feats_bn, cam_tokens_bn, _ = self.encode_vggt_batched(vggt_pre)             # [B,N,2048,64,64], [B,N,9]
 
@@ -429,7 +442,7 @@ class SamVGGT(nn.Module):
             boxes=None,
             masks=None,
         )   # sparse_e=[B,Np,256], dense_e=[B,256,64,64]
-        B, Np = sparse_e.shape    # after prompt encoder
+        B, Np, _ = sparse_e.shape    # after prompt encoder
         print("B: ", B)
         print("Np: ", Np)
         # ============================================================

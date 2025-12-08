@@ -1,30 +1,121 @@
+import os, random, math
+from typing import List, Tuple, Dict, Any, Optional
+import numpy as np
+from PIL import Image
 import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from segment_anything.modeling import MaskDecoder, TwoWayTransformer
+import shutil
+import tempfile
+import random
+from torchvision import transforms
 from sam_vggt_model import SamVGGT, build_sam_vggt
+from utils.loss_mask import loss_masks
+from utils.misc import sample_points_for_instances
+from torch.utils.data import DataLoader
+from utils.dataloader import MultiSceneImageDataset, SceneBatchSampler, RandomHFlip, Resize, multiview_collate
+def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
 
-model = build_sam_vggt()
-model.eval()
-# B=2 samples, each with N=3 frames
-batch_paths = [
-    ["data/kitchen/images/00.png","data/kitchen/images/01.png","data/kitchen/images/02.png"],
-    ["data/kitchen/images/03.png","data/kitchen/images/04.png","data/kitchen/images/05.png"],
-]
+    dataset = MultiSceneImageDataset(
+        root_dir=root_dir,
+        transform=transforms.Compose(my_transforms)
+    )
 
-# Optional prompts per sample (can be None)
-point_coords_list = [
-    torch.tensor([[320., 240.]]),  # sample 0: 1 point
-    torch.tensor([[100., 120.], [400., 300.]])  # sample 1: 2 points
-]
-point_labels_list = [
-    torch.tensor([1]),
-    torch.tensor([1, 0]),
-]
-prompt_frame_idx_list = [0, 2]  # prompts belong to frame 0 for sample 0, frame 2 for sample 1
+    sampler = SceneBatchSampler(
+        dataset, 
+        batch_size=batch_size, 
+        num_frames=num_frames
+    )
 
-outs = model.forward(
-    batch_image_paths=batch_paths,
-    point_coords_list=[point_coords_list],
-    point_labels_list=[point_labels_list],
-    point_frame_indices_list=[prompt_frame_idx_list],
-    multimask_output=False,
-    return_embeddings=False,
-)
+    loader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=multiview_collate,
+        num_workers=4,
+    )
+    return loader
+
+def inspect_dataloader(dataloader, num_batches=2, num_frames=8):
+    """
+    Inspect the dataloader output for correctness:
+    - batch size
+    - number of views per group
+    - shape correctness
+    - scene consistency inside each group
+    - instance ID range checks
+    """
+    print("\n================ DATALOADER INSPECTION ================")
+
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_batches:
+            break
+
+        images = batch["images"]    # expected [B, 8, 3, H, W]
+        labels = batch["labels"]    # expected [B, 8, 1, H, W]
+        scene_ids = batch["scene_id"]  # expected length = B
+
+        print(f"\n--- Batch {batch_idx} ---")
+        print(f"Images shape: {tuple(images.shape)}")
+        print(f"Labels shape: {tuple(labels.shape)}")
+
+        if images.ndim != 5:
+            print("❌ ERROR: images should be 5D [B, num_frames, 3, H, W]")
+            return
+
+        if labels.ndim != 5:
+            print("❌ ERROR: labels should be 5D [B, num_frames, 1, H, W]")
+            return
+
+        B, NF, C, H, W = images.shape
+
+        if NF != num_frames:
+            print(f"❌ ERROR: num_frames mismatch: expected {num_frames}, got {NF}")
+        else:
+            print(f"✔ num_frames correct: {NF}")
+
+        print(f"Batch size (groups): {B}")
+
+        # ---------- Check scene consistency ----------
+        print("\nScene ID consistency per group:")
+        if isinstance(scene_ids, list):
+            scene_ids = scene_ids  # from collate_fn
+        elif isinstance(scene_ids, torch.Tensor):
+            scene_ids = scene_ids.tolist()
+
+        for i, sid in enumerate(scene_ids):
+            print(f"  Group {i}: Scene ID = {sid}")
+
+        # ---------- Instance ID range check ----------
+        print("\nInstance ID ranges per group:")
+        for i in range(B):
+            group_labels = labels[i]  # [8, 1, H, W]
+            instance_ids = group_labels.unique()
+            min_id = int(instance_ids.min())
+            max_id = int(instance_ids.max())
+            print(f"  Group {i}: instance_id range = [{min_id}, {max_id}]")
+
+        # ---------- Quick pixel inspection ----------
+        print("\nRandom pixel check:")
+        rand_img = images[0, 0]  # first sample, first view
+        rand_label = labels[0, 0]
+
+        print(f"  Sample image min/max: {float(rand_img.min())}/{float(rand_img.max())}")
+        print(f"  Sample mask unique values (first few): {rand_label.unique()[:10]}")
+
+    print("\n========================================================\n")
+
+
+
+if __name__ == "__main__":
+
+    train_loader = create_dataloader(
+        root_dir="./hypersim",
+        batch_size=4,
+        num_frames=8,
+        my_transforms=[
+            Resize(size=[1024,1024]),
+        ]
+    )
+
+    inspect_dataloader(train_loader, num_batches=2, num_frames=8)

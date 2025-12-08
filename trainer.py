@@ -11,7 +11,7 @@ import tempfile
 import random
 from torchvision import transforms
 from sam_vggt_model import SamVGGT, build_sam_vggt
-from utils.dataloader import get_im_gt_name_dict, create_dataloaders, RandomHFlip, LargeScaleJitter, Resize, OnlineDataset
+from utils.dataloader import create_dataloader, RandomHFlip, Resize
 from utils.loss_mask import loss_masks
 from utils.misc import sample_points_for_instances
 
@@ -125,128 +125,115 @@ def create_dataloader_non_distributed(name_im_gt_list, my_transforms=[], batch_s
     return dataloader, gos_dataset
 
 
-
-# ---- New training loop for SAM-VGGT with 4 continuous images ----
 def train_sam_vggt(
     model,
     train_dataloader,
     optimizer,
-    device: str = "cuda",
-    num_frames: int = 8,
-    epochs: int = 1,
-    amp: bool = True,
+    device="cuda",
+    epochs=1,
+    amp=True,
+    num_frames=8,
 ):
+
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
     for epoch in range(epochs):
-        running_loss = 0.0
-        running_mask_loss = 0.0
-        running_dice_loss = 0.0
+        running_loss = 0
+        running_mask_loss = 0
+        running_dice_loss = 0
         num_batches = 0
 
         for batch_idx, data in enumerate(train_dataloader):
-            # Inputs from dataloader
-            # data["image"]:  [B_total, 3, 1024, 1024]
-            # data["label"]:  [B_total, 1, 1024, 1024]
-            images = data["image"].to(device)
-            labels = data["label"].to(device)
 
-            B_total = images.shape[0]
-            assert B_total % num_frames == 0
-            B = B_total // num_frames
-            N = num_frames
+            # ------------------------------------------------------------------
+            #  Extract batched inputs from dataloader
+            # ------------------------------------------------------------------
+            images = data["images"].to(device)       # [B, N, 3, 1024, 1024]
+            labels = data["labels"].to(device)       # [B, N, 1, 1024, 1024]
+            print(f"labels shape: {labels.shape}")
+            valid_ids_list = data["valid_ids"]       # list of B tensors, e.g. [tensor([3,10,...]), ...]
 
-            # Reshape into batches of groups
-            images_bn = images.view(B, N, 3, 1024, 1024)           # [B,N,3,1024,1024]
-            labels_bn = labels.view(B, N, 1, 1024, 1024)           # [B,N,1,1024,1024]
+            B, N, _, H, W = images.shape
+            assert N == num_frames
 
-            # Build SAM preprocessing input
-            sam_batch_list = []
+            # ------------------------------------------------------------------
+            #  Random instance selection PER GROUP using offline valid-IDs
+            # ------------------------------------------------------------------
+            chosen_ids = []
             for b in range(B):
-                sam_batch_list.append([images_bn[b, i].cpu() for i in range(N)])
-            sam_pre, _ = model.preprocess_sam_images_batched(sam_batch_list)   # [B,N,3,1024,1024]
-            sam_pre = sam_pre.to(device)
+                valid_ids = valid_ids_list[b]
+                rid = torch.randint(0, len(valid_ids), (1,))
+                chosen_ids.append(valid_ids[rid])
 
-            # Build VGGT preprocessing input
-            vggt_batch_list = []
-            for b in range(B):
-                frames = []
-                for i in range(N):
-                    img_np = images_bn[b, i].permute(1, 2, 0).cpu().numpy().astype(np.uint8)
-                    frames.append(Image.fromarray(img_np))
-                vggt_batch_list.append(frames)
+            # stack shape = [B]
+            chosen_ids = torch.stack(chosen_ids).to(device).squeeze(1)  # => [B]
 
-            vggt_pre = model.preprocess_vggt_images_batched(vggt_batch_list).to(device)  # [B,N,3,Hv,Wv]
+            # ------------------------------------------------------------------
+            #  Build binary mask for each (B, N) and then concatenate width
+            # ------------------------------------------------------------------
+            # labels: [B,N,1,H,W] → squeeze for comparison
+            labels_2d = labels.squeeze(2)            # [B,N,H,W]
 
-            # Compute instance masks per batch group
+            # chosen_ids: [B] → match dims for broadcasting
+            chosen_ids_exp = chosen_ids[:, None, None, None]   # [B,1,1,1]
+            print("chosen_ids.shape =", chosen_ids.shape)
+            print("chosen_ids_exp.shape =", chosen_ids_exp.shape)
+
+            print(f"labels_2d shape: {labels_2d.shape}")
+            binary_masks = (labels_2d == chosen_ids_exp).float()   # [B,N,H,W]
+            print(f"binary_masks shape: {binary_masks.shape}")
+
+            # Reshape to concatenate across frames
+            mask_cat = binary_masks.reshape(B, H, W * N)  # [B,H,W*N]
+
+            labels_cat = labels_2d.reshape(B, H, W * N)   # [B, H, W*N]
+
+            sampled_points = sample_points_for_instances(
+                labels_cat,        # correct
+                chosen_ids,        # [B]
+                k=10
+            )
+
+            # sampled_points[b] = tensor [K, 2]
+
+            # ------------------------------------------------------------------
+            #  Convert global concatenated coords → per-frame coords
+            # ------------------------------------------------------------------
+            frame_width = W
+
             point_coords_list = []
             point_labels_list = []
             point_frame_indices_list = []
 
             for b in range(B):
-                labels_b = labels_bn[b]        # [N,1,1024,1024]
-                labels_b_2d = labels_b.squeeze(1)   # [N,1024,1024]
+                pts = sampled_points[b]       # [K,2]
+                x_all, y_all = pts[:, 0], pts[:, 1]
 
-                # Collect non-zero instance ids from all frames
-                unique_ids = torch.unique(labels_b_2d)
-                unique_ids = unique_ids[unique_ids != 0]
+                frame_idx = (x_all // frame_width).long()  # which of N frames
+                x_local = x_all % frame_width
 
-                target_instance_id = None
-                mask_proportion = 0
-                attempts = 0
+                point_coords = torch.stack([x_local, y_all], dim=1).to(device)
+                point_labels = torch.ones(len(pts), dtype=torch.int64, device=device)
 
-                while mask_proportion < 0.0025 and attempts < 100:
-                    rid = torch.randint(0, len(unique_ids), (1,)).item()
-                    val = unique_ids[rid].item()
-                    target_instance_id = torch.tensor(val, dtype=labels_b_2d.dtype, device=device)
+                point_coords_list.append(point_coords)
+                point_labels_list.append(point_labels)
+                point_frame_indices_list.append(frame_idx.to(device))
 
-                    binary_masks_b = (labels_b_2d == target_instance_id).float()
-                    frame_pixels = labels_b_2d.shape[-1] * labels_b_2d.shape[-2]
-                    proportions = [(binary_masks_b[i].sum().item() / frame_pixels) for i in range(N)]
-                    mask_proportion = max(proportions)
-                    attempts += 1
+            # ------------------------------------------------------------------
+            #  SAM + VGGT Preprocessing (B,N,3,H,W) → pre-tensors
+            # ------------------------------------------------------------------
+            # SAM preprocess is already batched:
+            # sam_pre, _ = model.preprocess_sam_images_batched(images)   # [B,N,3,1024,1024]
 
-                binary_masks_b = binary_masks_b.unsqueeze(1)    # [N,1,H,W]
+            sam_pre = images.to(device)
 
-                # Concatenate masks along width: [N,1,H,W] → [1,H,W*N]
-                mask_cat = torch.cat([binary_masks_b[i] for i in range(N)], dim=2)   # wrong dim, correct below
-
-                # Fix: concatenate along width dim=3
-                mask_cat = torch.cat([binary_masks_b[i] for i in range(N)], dim=3)   # [N,1,H,W*N]
-                mask_cat = mask_cat[0].unsqueeze(0)                                 # [1,1,H,W*N]
-
-                # Sample points from concatenated mask
-                sampled = sample_points_for_instances(
-                    mask_cat,              # [1,1,H,W*N]
-                    target_instance_id.view(1),
-                    k=10
-                )[0]                       # [10,2]
-
-                coords_b = []
-                labels_b_out = []
-                frame_idx_b = []
-
-                frame_width = 1024
-
-                for p in sampled:
-                    x, y = p[0].item(), p[1].item()
-                    fidx = int(x // frame_width)
-                    x_local = x % frame_width
-                    if 0 <= fidx < N:
-                        coords_b.append(torch.tensor([x_local, y], device=device))
-                        labels_b_out.append(torch.tensor(1, device=device))
-                        frame_idx_b.append(fidx)
-
-                point_coords_list.append(torch.stack(coords_b, dim=0))
-                point_labels_list.append(torch.tensor(labels_b_out, device=device))
-                point_frame_indices_list.append(torch.tensor(frame_idx_b, dtype=torch.long, device=device))
-
-            # Forward pass
+            # ------------------------------------------------------------------
+            #  Forward pass
+            # ------------------------------------------------------------------
             with torch.cuda.amp.autocast(enabled=amp):
                 outputs = model.forward(
                     sam_pre=sam_pre,
-                    vggt_pre=vggt_pre,
                     point_coords_list=point_coords_list,
                     point_labels_list=point_labels_list,
                     point_frame_indices_list=point_frame_indices_list,
@@ -254,24 +241,18 @@ def train_sam_vggt(
                     visualize=False,
                 )
 
-            low_res_masks = outputs["low_res_logits"]    # [B,C,256,256*N]
-            iou_preds = outputs["iou_predictions"]
+            low_res_masks = outputs["low_res_logits"]    # [B,1,256,256*N]
 
-            # Build target masks for each batch group
-            target_masks = []
-            for b in range(B):
-                # binary mask cat = [N,1,H,W] → concatenate width → [H,W*N]
-                mask_cat_b = torch.cat(
-                    [labels_bn[b, i] for i in range(N)], dim=3
-                )  # [1,1024,1024*N]
-                target_masks.append(mask_cat_b)
+            # ------------------------------------------------------------------
+            #  Build target masks for loss
+            # ------------------------------------------------------------------
+            target_masks = mask_cat.unsqueeze(1).to(device)   # [B,1,H,W*N]
+            print(f"low_res_masks shape: {low_res_masks.shape}")
+            pred_masks = low_res_masks[:, 0:1]
 
-            target_masks = torch.stack(target_masks, dim=0).to(device)  # [B,1,1024,1024*N]
-
-            # Use only first mask channel if multimask_output=False
-            pred_masks = low_res_masks[:, 0:1]  # [B,1,256,256*N]
-
-            # Loss
+            # ------------------------------------------------------------------
+            #  Loss
+            # ------------------------------------------------------------------
             loss_mask, loss_dice = loss_masks(
                 pred_masks.float(),
                 target_masks.float(),
@@ -284,61 +265,40 @@ def train_sam_vggt(
             scaler.step(optimizer)
             scaler.update()
 
+            # ------------------------------------------------------------------
+            #  Logging
+            # ------------------------------------------------------------------
             running_loss += loss.item()
             running_mask_loss += loss_mask.item()
             running_dice_loss += loss_dice.item()
             num_batches += 1
 
             if (batch_idx + 1) % 50 == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx+1}: "
-                      f"Loss={running_loss/num_batches:.4f}, "
-                      f"Mask={running_mask_loss/num_batches:.4f}, "
-                      f"Dice={running_dice_loss/num_batches:.4f}")
+                print(
+                    f"Epoch {epoch+1}, Batch {batch_idx+1}: "
+                    f"Loss={running_loss/num_batches:.4f}, "
+                    f"Mask={running_mask_loss/num_batches:.4f}, "
+                    f"Dice={running_dice_loss/num_batches:.4f}"
+                )
 
-        print(f"Completed epoch {epoch+1}: "
-              f"Loss={running_loss/num_batches:.4f}, "
-              f"Mask={running_mask_loss/num_batches:.4f}, "
-              f"Dice={running_dice_loss/num_batches:.4f}")
+        print(
+            f"Completed epoch {epoch+1}: "
+            f"Loss={running_loss/num_batches:.4f}, "
+            f"Mask={running_mask_loss/num_batches:.4f}, "
+            f"Dice={running_dice_loss/num_batches:.4f}"
+        )
 
 
 def main():
     # 1. Define your datasets (same format as SAM training)
-    train_datasets = [
-        {
-            "name": "Dataset1",
-            "im_dir": "./ai_001_001_00/color",
-            "gt_dir": "./ai_001_001_00/instance",
-            "im_ext": ".jpg",
-            "gt_ext": ".png"
-        },
-        {
-            "name": "Dataset2",
-            "im_dir": "./ai_017_003_00/color",
-            "gt_dir": "./ai_017_003_00/instance",
-            "im_ext": ".jpg",
-            "gt_ext": ".png"
-        },
-        {
-            "name": "Dataset3",
-            "im_dir": "./ai_018_009_01/color",
-            "gt_dir": "./ai_018_009_01/instance",
-            "im_ext": ".jpg",
-            "gt_ext": ".png"
-        },
-        # Add more datasets as needed
-    ]
-    
-    # 2. Create dataloader (non-distributed version for single-GPU training)
-    train_im_gt_list = get_im_gt_name_dict(train_datasets, flag="train")
-    train_dataloader, _ = create_dataloader_non_distributed(
-        train_im_gt_list,
+
+    train_loader = create_dataloader(
+        root_dir="./hypersim",
+        batch_size=1,
+        num_frames=8,
         my_transforms=[
-            RandomHFlip(),
             Resize(size=[1024,1024]),
-            # LargeScaleJitter()  # Outputs 1024x1024 images
-        ],
-        batch_size=8,
-        num_frames=8
+        ]
     )
     
     # 3. Initialize your model
@@ -368,13 +328,13 @@ def main():
 
     # 4. UNFREEZE ONLY the small "heads" inside the decoder
     #    (A) Hypernetwork MLPs (predict per-mask dynamic filters)
-    for mlp in model.sam.mask_decoder.output_hypernetworks_mlps:
-        for p in mlp.parameters():
-            p.requires_grad = True
+    # for mlp in model.sam.mask_decoder.output_hypernetworks_mlps:
+    #     for p in mlp.parameters():
+    #         p.requires_grad = True
 
-    #    (B) IoU prediction head
-    for p in model.sam.mask_decoder.iou_prediction_head.parameters():
-        p.requires_grad = True
+    # #    (B) IoU prediction head
+    # for p in model.sam.mask_decoder.iou_prediction_head.parameters():
+    #     p.requires_grad = True
 
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -387,7 +347,7 @@ def main():
     # 6. Call the training function
     train_sam_vggt(
         model=model,
-        train_dataloader=train_dataloader,
+        train_dataloader=train_loader,
         optimizer=optimizer,
         device=device,
         num_frames=8,  # Number of continuous images per batch
@@ -398,9 +358,5 @@ def main():
     print("Training completed!")
 
 if __name__ == "__main__":
-    # Check if running in distributed mode
-    # if 'RANK' in os.environ or 'WORLD_SIZE' in os.environ:
-    #     main_distributed()
-    # else:
     main()  # Single GPU mode
 

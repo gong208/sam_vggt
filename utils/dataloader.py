@@ -10,7 +10,7 @@ from copy import deepcopy
 from skimage import io
 import os
 from glob import glob
-
+import json
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torchvision import transforms, utils
@@ -101,15 +101,40 @@ class RandomHFlip(object):
         return {'imidx':imidx,'image':image, 'label':label, 'shape':shape}
 
 class Resize(object):
-    def __init__(self,size=[320,320]):
-        self.size = size
-    def __call__(self,sample):
-        imidx, image, label, shape =  sample['imidx'], sample['image'], sample['label'], sample['shape']
+    def __init__(self, size=[320, 320]):
+        self.size = size  # [H, W]
 
-        image = torch.squeeze(F.interpolate(torch.unsqueeze(image,0),self.size,mode='bilinear'),dim=0)
-        label = torch.squeeze(F.interpolate(torch.unsqueeze(label,0),self.size,mode='nearest'),dim=0)
+    def __call__(self, sample):
+        image = sample["image"]             # float32 OK
+        label = sample["label"]             # int32 or int64 FAILS in interpolate
 
-        return {'imidx':imidx,'image':image, 'label':label, 'shape':torch.tensor(self.size)}
+        # --- Resize image (float32, bilinear) ---
+        image = F.interpolate(
+            image.unsqueeze(0),
+            size=self.size,
+            mode="bilinear",
+            align_corners=False
+        ).squeeze(0)
+
+        # --- Resize mask (convert to float → resize → cast back to int) ---
+        label_float = label.float().unsqueeze(0)   # [1, 1, H, W]
+
+        label_resized = F.interpolate(
+            label_float,
+            size=self.size,
+            mode="nearest"
+        ).squeeze(0)
+
+        # convert back to integer instance IDs
+        label = label_resized.to(torch.int64)
+
+        sample["image"] = image
+        sample["label"] = label
+        sample["shape"] = torch.tensor(self.size)
+
+        return sample
+
+
 
 class RandomCrop(object):
     def __init__(self,size=[288,288]):
@@ -276,17 +301,15 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from skimage import io
-
 class MultiSceneImageDataset(Dataset):
     """
-    Dataset that returns ONE image + mask at a time.
-    Scene grouping is handled externally by the sampler.
+    Dataset that returns ONE image + mask + per-image valid instance IDs.
     """
     def __init__(self, root_dir, transform=None):
         self.root_dir = root_dir
         self.transform = transform
 
-        self.items = []   # flat list of image entries
+        self.items = []   # list of dicts
         self.scenes = {}  # scene_id -> list of indices in self.items
 
         scene_dirs = sorted(os.listdir(root_dir))
@@ -299,24 +322,33 @@ class MultiSceneImageDataset(Dataset):
 
             color_dir = os.path.join(scene_path, "color")
             inst_dir  = os.path.join(scene_path, "instance")
+            valid_dir = os.path.join(scene_path, "valid_ids")   # NEW
 
             color_files = sorted(os.listdir(color_dir))
             inst_files  = sorted(os.listdir(inst_dir))
+            valid_files = sorted(os.listdir(valid_dir))
 
-            assert len(color_files) == len(inst_files), \
-                f"Scene {scene_name}: mismatching image and mask count"
+            assert len(color_files) == len(inst_files) == len(valid_files), \
+                f"Scene {scene_name} mismatch between color, instance, valid_ids."
 
             self.scenes[scene_idx] = []
 
-            for i, (im_name, gt_name) in enumerate(zip(color_files, inst_files)):
-                im_path = os.path.join(color_dir, im_name)
-                gt_path = os.path.join(inst_dir, gt_name)
+            for i, (im_name, gt_name, valid_name) in enumerate(zip(color_files, inst_files, valid_files)):
+                im_path    = os.path.join(color_dir, im_name)
+                gt_path    = os.path.join(inst_dir, gt_name)
+                valid_path = os.path.join(valid_dir, valid_name)
+
+                # load precomputed valid instance IDs
+                with open(valid_path, "r") as f:
+                    valid_ids = json.load(f)["ids"]
 
                 self.items.append({
                     "image_path": im_path,
                     "label_path": gt_path,
+                    "valid_ids": torch.tensor(valid_ids, dtype=torch.int64),   # NEW
                     "scene_id": scene_idx,
                 })
+
                 self.scenes[scene_idx].append(len(self.items) - 1)
 
             scene_idx += 1
@@ -339,7 +371,7 @@ class MultiSceneImageDataset(Dataset):
         # load instance mask
         mask = io.imread(entry["label_path"])
         if mask.ndim > 2:
-            mask = mask[:, :, 0]  # instance_id is stored in the first channel
+            mask = mask[:, :, 0]
 
         im = torch.tensor(im, dtype=torch.float32).permute(2, 0, 1)
         mask = torch.tensor(mask, dtype=torch.int32).unsqueeze(0)
@@ -349,6 +381,7 @@ class MultiSceneImageDataset(Dataset):
             "label": mask,
             "scene_id": entry["scene_id"],
             "index": index,
+            "valid_ids": entry["valid_ids"],  # NEW
         }
 
         if self.transform:
@@ -357,47 +390,7 @@ class MultiSceneImageDataset(Dataset):
         return sample
 
 
-import random
 from torch.utils.data import Sampler
-
-class SceneGroupSampler(Sampler):
-    """
-    Returns groups of num_frames indices per iteration.
-    Ensures all indices in a group come from the same scene.
-    """
-
-    def __init__(self, dataset, num_frames=8, shuffle=True):
-        self.dataset = dataset
-        self.num_frames = num_frames
-        self.shuffle = shuffle
-
-        # Precompute groups of size num_frames for each scene
-        self.groups = []
-
-        for scene_id, indices in dataset.scenes.items():
-            if len(indices) < num_frames:
-                continue
-
-            indices = list(indices)
-
-            if shuffle:
-                random.shuffle(indices)
-
-            # sequential groups of num_frames
-            for i in range(0, len(indices) - num_frames + 1, num_frames):
-                self.groups.append(indices[i:i + num_frames])
-
-        print(f"[Sampler] Created {len(self.groups)} groups with size {num_frames}")
-
-    def __len__(self):
-        return len(self.groups)
-
-    def __iter__(self):
-        if self.shuffle:
-            random.shuffle(self.groups)
-
-        for g in self.groups:
-            yield g
 
 class SceneBatchSampler(Sampler):
     def __init__(self, dataset, batch_size, num_frames=8, shuffle=True):
@@ -420,7 +413,7 @@ class SceneBatchSampler(Sampler):
             for i in range(0, len(idxs) - num_frames + 1, num_frames):
                 self.groups.append(idxs[i:i + num_frames])
 
-        print(f"[Sampler] Total groups = {len(self.groups)}")
+        # print(f"[Sampler] Total groups = {len(self.groups)}")
 
     def __len__(self):
         return len(self.groups) // self.batch_size
@@ -444,22 +437,75 @@ class SceneBatchSampler(Sampler):
 
 
 
-def multiview_collate(batch):
+def multiview_collate(batch, num_frames=8):
     """
-    batch: list of size BATCH_SIZE, each element is a list of size num_frames
+    batch: list of samples = batch_size * num_frames
+    Each sample contains:
+        image: [3,H,W]
+        label: [1,H,W]
+        valid_ids: [K_i]
     """
-    # flatten: batch becomes list of samples
-    # PyTorch gives us one group at a time, so batch = [sample0, ... sample7]
+    # stack images and labels
+    images = torch.stack([b["image"] for b in batch], dim=0)
+    labels = torch.stack([b["label"] for b in batch], dim=0)
+    scene_ids = [b["scene_id"] for b in batch]
 
-    images = torch.stack([item["image"] for item in batch], dim=0)
-    labels = torch.stack([item["label"] for item in batch], dim=0)
-    scene_ids = [item["scene_id"] for item in batch]
+    # infer batch size
+    B = len(batch) // num_frames
+
+    # reshape to [B, N, ...]
+    images = images.view(B, num_frames, *images.shape[1:])
+    labels = labels.view(B, num_frames, *labels.shape[1:])
+
+    # group-level scene id
+    scene_ids = [scene_ids[i*num_frames] for i in range(B)]
+
+    # ----------------------------
+    # NEW: compute group-level valid ids
+    # ----------------------------
+    group_valid_ids = []
+
+    for b in range(B):
+        start = b * num_frames
+        end   = (b + 1) * num_frames
+
+        # collect valid_ids for this group
+        ids_group = []
+        for i in range(start, end):
+            ids_group.append(batch[i]["valid_ids"])  # [K_i]
+
+        # union across images (concatenate and unique)
+        ids_union = torch.unique(torch.cat(ids_group, dim=0))
+        group_valid_ids.append(ids_union)
 
     return {
-        "images": images,  # [8, 3, H, W]
-        "labels": labels,  # [8, 1, H, W]
-        "scene_id": scene_ids[0],  # all same
+        "images": images,
+        "labels": labels,
+        "scene_id": scene_ids,
+        "valid_ids": group_valid_ids,   # list of length B, each entry is a tensor
     }
+
+def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
+
+    dataset = MultiSceneImageDataset(
+        root_dir=root_dir,
+        transform=transforms.Compose(my_transforms)
+    )
+
+    sampler = SceneBatchSampler(
+        dataset, 
+        batch_size=batch_size, 
+        num_frames=num_frames
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=multiview_collate,
+        num_workers=4,
+    )
+    return loader
+
 
 
 
