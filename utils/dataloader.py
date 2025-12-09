@@ -495,7 +495,8 @@ def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
     sampler = SceneBatchSampler(
         dataset, 
         batch_size=batch_size, 
-        num_frames=num_frames
+        num_frames=num_frames,
+        shuffle=False
     )
 
     loader = DataLoader(

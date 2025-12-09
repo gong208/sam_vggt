@@ -1,5 +1,4 @@
 import os, random, math
-from typing import List, Tuple, Dict, Any, Optional
 import numpy as np
 from PIL import Image
 import torch
@@ -14,8 +13,8 @@ from sam_vggt_model import SamVGGT, build_sam_vggt
 from utils.dataloader import create_dataloader, RandomHFlip, Resize
 from utils.loss_mask import loss_masks
 from utils.misc import sample_points_for_instances
-
-
+import time
+import wandb
 # ---- Helper function to create non-distributed dataloader ----
 class SceneGroupedBatchSampler:
     """
@@ -135,6 +134,19 @@ def train_sam_vggt(
     num_frames=8,
 ):
 
+    wandb.init(
+        project="sam-vggt-multiview",
+        config={
+            "epochs": epochs,
+            "batch_size": train_dataloader.batch_size,
+            "num_frames": num_frames,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "amp": amp,
+            "consecutive": True,
+            "scene": 'ai_001_001_00'
+        },
+        name=f"experiment_epoch{epochs}_bs{train_dataloader.batch_size}",
+    )
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
@@ -151,7 +163,7 @@ def train_sam_vggt(
             # ------------------------------------------------------------------
             images = data["images"].to(device)       # [B, N, 3, 1024, 1024]
             labels = data["labels"].to(device)       # [B, N, 1, 1024, 1024]
-            print(f"labels shape: {labels.shape}")
+            # print(f"labels shape: {labels.shape}")
             valid_ids_list = data["valid_ids"]       # list of B tensors, e.g. [tensor([3,10,...]), ...]
 
             B, N, _, H, W = images.shape
@@ -177,17 +189,19 @@ def train_sam_vggt(
 
             # chosen_ids: [B] → match dims for broadcasting
             chosen_ids_exp = chosen_ids[:, None, None, None]   # [B,1,1,1]
-            print("chosen_ids.shape =", chosen_ids.shape)
-            print("chosen_ids_exp.shape =", chosen_ids_exp.shape)
+            # print("chosen_ids.shape =", chosen_ids.shape)
+            # print("chosen_ids_exp.shape =", chosen_ids_exp.shape)
 
-            print(f"labels_2d shape: {labels_2d.shape}")
+            # print(f"labels_2d shape: {labels_2d.shape}")
             binary_masks = (labels_2d == chosen_ids_exp).float()   # [B,N,H,W]
-            print(f"binary_masks shape: {binary_masks.shape}")
+            # print(f"binary_masks shape: {binary_masks.shape}")
 
             # Reshape to concatenate across frames
-            mask_cat = binary_masks.reshape(B, H, W * N)  # [B,H,W*N]
+            # mask_cat = binary_masks.reshape(B, H, W * N)  # [B,H,W*N]
 
-            labels_cat = labels_2d.reshape(B, H, W * N)   # [B, H, W*N]
+            # labels_cat = labels_2d.reshape(B, H, W * N)   # [B, H, W*N]
+            labels_cat = torch.cat([labels_2d[:, i] for i in range(N)], dim=2)     # [B, H, W*N]
+            mask_cat   = torch.cat([binary_masks[:, i] for i in range(N)], dim=2) # [B, H, W*N]
 
             sampled_points = sample_points_for_instances(
                 labels_cat,        # correct
@@ -231,6 +245,7 @@ def train_sam_vggt(
             # ------------------------------------------------------------------
             #  Forward pass
             # ------------------------------------------------------------------
+            forward_start = time.time()
             with torch.cuda.amp.autocast(enabled=amp):
                 outputs = model.forward(
                     sam_pre=sam_pre,
@@ -240,14 +255,15 @@ def train_sam_vggt(
                     multimask_output=False,
                     visualize=False,
                 )
-
+            forward_end = time.time()
+            # print(f"Forward pass completed in {forward_end - forward_start} seconds")
             low_res_masks = outputs["low_res_logits"]    # [B,1,256,256*N]
 
             # ------------------------------------------------------------------
             #  Build target masks for loss
             # ------------------------------------------------------------------
             target_masks = mask_cat.unsqueeze(1).to(device)   # [B,1,H,W*N]
-            print(f"low_res_masks shape: {low_res_masks.shape}")
+            # print(f"low_res_masks shape: {low_res_masks.shape}")
             pred_masks = low_res_masks[:, 0:1]
 
             # ------------------------------------------------------------------
@@ -259,6 +275,13 @@ def train_sam_vggt(
                 num_masks=1.0,
             )
             loss = loss_mask + loss_dice
+            wandb.log({
+                "loss/total": loss.item(),
+                "loss/mask": loss_mask.item(),
+                "loss/dice": loss_dice.item(),
+                "lr": optimizer.param_groups[0]["lr"],
+                "step": batch_idx + epoch * len(train_dataloader)
+            })
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -287,6 +310,13 @@ def train_sam_vggt(
             f"Mask={running_mask_loss/num_batches:.4f}, "
             f"Dice={running_dice_loss/num_batches:.4f}"
         )
+        wandb.log({
+            "epoch_loss/total": running_loss / num_batches,
+            "epoch_loss/mask": running_mask_loss / num_batches,
+            "epoch_loss/dice": running_dice_loss / num_batches,
+            "epoch": epoch + 1
+        })
+    wandb.finish()
 
 
 def main():
@@ -324,7 +354,7 @@ def main():
 
     # 3. Freeze entire decoder first
     for p in model.sam.mask_decoder.parameters():
-        p.requires_grad = False
+        p.requires_grad = True
 
     # 4. UNFREEZE ONLY the small "heads" inside the decoder
     #    (A) Hypernetwork MLPs (predict per-mask dynamic filters)
@@ -345,16 +375,18 @@ def main():
     model = model.to(device)
     
     # 6. Call the training function
+    time_start = time.time()
     train_sam_vggt(
         model=model,
         train_dataloader=train_loader,
         optimizer=optimizer,
         device=device,
         num_frames=8,  # Number of continuous images per batch
-        epochs=1,  # Number of epochs to train
+        epochs=100,  # Number of epochs to train
         amp=True  # Use mixed precision
     )
-    
+    time_end = time.time()
+    print(f"Training completed in {time_end - time_start} seconds")
     print("Training completed!")
 
 if __name__ == "__main__":

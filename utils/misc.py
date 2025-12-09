@@ -474,7 +474,7 @@ def sample_points_for_instances(masks, instance_ids, k=10):
     results = []
     for b in range(B):
         inst = instance_ids[b]
-        print(f"inst: {inst}")
+        # print(f"inst: {inst}")
         sel = (masks[b] == inst)
 
         x_idx = x[sel]
@@ -482,6 +482,7 @@ def sample_points_for_instances(masks, instance_ids, k=10):
 
         if len(x_idx) < k:
             # pad if object too small
+            print(f"len(x_idx): {len(x_idx)}")
             perm = torch.randint(0, len(x_idx), (k,))
         else:
             perm = torch.randperm(len(x_idx))[:k]

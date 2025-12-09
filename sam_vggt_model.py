@@ -443,8 +443,8 @@ class SamVGGT(nn.Module):
             masks=None,
         )   # sparse_e=[B,Np,256], dense_e=[B,256,64,64]
         B, Np, _ = sparse_e.shape    # after prompt encoder
-        print("B: ", B)
-        print("Np: ", Np)
+        # print("B: ", B)
+        # print("Np: ", Np)
         # ============================================================
         # 7) TILE dense embeddings and PE across frames (batched)
         # ============================================================
@@ -454,8 +454,7 @@ class SamVGGT(nn.Module):
         # ============================================================
         # 8) Flatten embeddings across frames for SAM decoder
         # ============================================================
-        concat_embed_bn = fused_bn.reshape(B, 256, 64, 64 * N)   # [B,256,64,64N]
-
+        concat_embed_bn = torch.cat([fused_bn[:, i] for i in range(N)], dim=3)
         # ============================================================
         # 9) Batchify frame indices
         # ============================================================
