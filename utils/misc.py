@@ -464,11 +464,12 @@ def sample_points_for_instances(masks, instance_ids, k=10):
     instance_ids: [B]       which instance to sample for each image
     returns: [B, k, 2]      (x, y) pixel coords
     """
-    print(f"instance_ids: {instance_ids}")
+    # print(f"instance_ids: {instance_ids}")
     B, H, W = masks.shape
     y, x = torch.meshgrid(
         torch.arange(H, device=masks.device),
-        torch.arange(W, device=masks.device)
+        torch.arange(W, device=masks.device),
+        indexing='ij'
     )
     
     results = []

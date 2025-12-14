@@ -145,7 +145,7 @@ def train_sam_vggt(
             "consecutive": True,
             "scene": 'ai_001_001_00'
         },
-        name=f"experiment_epoch{epochs}_bs{train_dataloader.batch_size}",
+        name=f"experiment_epoch{epochs}_lr{optimizer.param_groups[0]['lr']}",
     )
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
@@ -316,6 +316,26 @@ def train_sam_vggt(
             "epoch_loss/dice": running_dice_loss / num_batches,
             "epoch": epoch + 1
         })
+        os.makedirs("checkpoints", exist_ok=True)
+
+        checkpoint = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),  # if using AMP
+            "loss": running_loss / num_batches,
+            "num_frames": num_frames,
+        }
+
+        torch.save(
+            checkpoint,
+            f"checkpoints/sam_vggt_epoch_{epoch+1}.pth"
+        )
+
+        if epoch == 0 or running_loss < best_loss:
+            best_loss = running_loss
+            torch.save(checkpoint, "checkpoints/sam_vggt_best.pth")
+
     wandb.finish()
 
 
@@ -368,7 +388,7 @@ def main():
 
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=1e-4, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(trainable_params, lr=3e-3, weight_decay=0.0)
     # optimizer = None
     # 5. Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -383,7 +403,7 @@ def main():
         device=device,
         num_frames=8,  # Number of continuous images per batch
         epochs=100,  # Number of epochs to train
-        amp=True  # Use mixed precision
+        amp=False  # Use mixed precision
     )
     time_end = time.time()
     print(f"Training completed in {time_end - time_start} seconds")
