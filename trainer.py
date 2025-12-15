@@ -327,10 +327,6 @@ def train_sam_vggt(
             "num_frames": num_frames,
         }
 
-        torch.save(
-            checkpoint,
-            f"checkpoints/sam_vggt_epoch_{epoch+1}.pth"
-        )
 
         if epoch == 0 or running_loss < best_loss:
             best_loss = running_loss
