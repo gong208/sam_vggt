@@ -52,9 +52,6 @@ def train_sam_vggt(
 
         for batch_idx, data in enumerate(train_dataloader):
 
-            # ------------------------------------------------------------------
-            #  Extract batched inputs from dataloader
-            # ------------------------------------------------------------------
             images = data["images"].to(device)       # [B, N, 3, 1024, 1024]
             labels = data["labels"].to(device)       # [B, N, 1, 1024, 1024]
             # print(f"labels shape: {labels.shape}")
@@ -64,9 +61,6 @@ def train_sam_vggt(
             print(f"B: {B}, N: {N}, H: {H}, W: {W}")
             assert N == num_frames
 
-            # ------------------------------------------------------------------
-            #  Random instance selection PER GROUP using offline valid-IDs
-            # ------------------------------------------------------------------
             chosen_ids = []
             for b in range(B):
                 valid_ids = valid_ids_list[b]
@@ -76,9 +70,7 @@ def train_sam_vggt(
             # stack shape = [B]
             chosen_ids = torch.stack(chosen_ids).to(device).squeeze(1)  # => [B]
 
-            # ------------------------------------------------------------------
-            #  Build binary mask for each (B, N) and then concatenate width
-            # ------------------------------------------------------------------
+
             # labels: [B,N,1,H,W] → squeeze for comparison
             labels_2d = labels.squeeze(2)            # [B,N,H,W]
 
@@ -106,9 +98,7 @@ def train_sam_vggt(
 
             # sampled_points[b] = tensor [K, 2]
 
-            # ------------------------------------------------------------------
-            #  Convert global concatenated coords → per-frame coords
-            # ------------------------------------------------------------------
+
             frame_width = W
 
             point_coords_list = []
@@ -129,17 +119,12 @@ def train_sam_vggt(
                 point_labels_list.append(point_labels)
                 point_frame_indices_list.append(frame_idx.to(device))
 
-            # ------------------------------------------------------------------
-            #  SAM + VGGT Preprocessing (B,N,3,H,W) → pre-tensors
-            # ------------------------------------------------------------------
+
             # SAM preprocess is already batched:
             # sam_pre, _ = model.preprocess_sam_images_batched(images)   # [B,N,3,1024,1024]
 
             sam_pre = images.to(device)
 
-            # ------------------------------------------------------------------
-            #  Forward pass
-            # ------------------------------------------------------------------
             forward_start = time.time()
             with torch.cuda.amp.autocast(enabled=amp):
                 outputs = model.forward(
@@ -154,16 +139,12 @@ def train_sam_vggt(
             # print(f"Forward pass completed in {forward_end - forward_start} seconds")
             low_res_masks = outputs["low_res_logits"]    # [B,1,256,256*N]
 
-            # ------------------------------------------------------------------
-            #  Build target masks for loss
-            # ------------------------------------------------------------------
+
             target_masks = mask_cat.unsqueeze(1).to(device)   # [B,1,H,W*N]
             # print(f"target_masks shape: {target_masks.shape}")
             pred_masks = low_res_masks[:, 0:1]
             num_masks = float(pred_masks.shape[0])
-            # ------------------------------------------------------------------
-            #  Loss
-            # ------------------------------------------------------------------
+
             loss_mask, loss_dice = loss_masks(
                 pred_masks.float(), target_masks.float(),
                 num_masks=1.0, debug=True,
@@ -185,9 +166,7 @@ def train_sam_vggt(
             scaler.step(optimizer)
             scaler.update()
 
-            # ------------------------------------------------------------------
-            #  Logging
-            # ------------------------------------------------------------------
+
             running_loss += loss.item()
             running_mask_loss += loss_mask.item()
             running_dice_loss += loss_dice.item()
