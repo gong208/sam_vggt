@@ -445,6 +445,16 @@ def multiview_collate(batch, num_frames=8):
         label: [1,H,W]
         valid_ids: [K_i]
     """
+    # Safety check: ensure batch is not empty and has correct size
+    if len(batch) == 0:
+        raise ValueError(f"Empty batch received in multiview_collate")
+    
+    if len(batch) % num_frames != 0:
+        raise ValueError(
+            f"Batch size {len(batch)} is not divisible by num_frames {num_frames}. "
+            f"This suggests an issue with the sampler or dataloader configuration."
+        )
+    
     # stack images and labels
     images = torch.stack([b["image"] for b in batch], dim=0)
     labels = torch.stack([b["label"] for b in batch], dim=0)
@@ -452,6 +462,12 @@ def multiview_collate(batch, num_frames=8):
 
     # infer batch size
     B = len(batch) // num_frames
+    
+    if B == 0:
+        raise ValueError(
+            f"Computed batch size B={B} is zero. "
+            f"len(batch)={len(batch)}, num_frames={num_frames}"
+        )
 
     # reshape to [B, N, ...]
     images = images.view(B, num_frames, *images.shape[1:])
@@ -499,10 +515,14 @@ def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
         shuffle=False
     )
 
+    # Create a partial collate function with num_frames pre-filled
+    from functools import partial
+    collate_fn = partial(multiview_collate, num_frames=num_frames)
+
     loader = DataLoader(
         dataset,
         batch_sampler=sampler,
-        collate_fn=multiview_collate,
+        collate_fn=collate_fn,
         num_workers=4,
     )
     return loader

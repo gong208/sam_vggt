@@ -9,7 +9,7 @@ import torch
 from skimage import io
 from tqdm import tqdm
 
-def compute_valid_ids_per_image(scene_path, area_ratio_threshold=0.003):
+def compute_valid_ids_per_image(scene_path, area_ratio_threshold=0.05):
     """
     Only keep instance IDs whose area >= threshold * image_area.
     """

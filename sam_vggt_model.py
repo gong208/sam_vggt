@@ -482,6 +482,8 @@ class SamVGGT(nn.Module):
         outputs = {
             "iou_predictions": iou_pred_bn,
             "low_res_logits": low_res_masks_bn,
+            "sam_feats": sam_feats_bn,
+            "vggt_feats": vggt_feats_bn,
         }
         if visualize:
         # ============================================================

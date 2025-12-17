@@ -15,113 +15,6 @@ from utils.loss_mask import loss_masks
 from utils.misc import sample_points_for_instances
 import time
 import wandb
-# ---- Helper function to create non-distributed dataloader ----
-class SceneGroupedBatchSampler:
-    """
-    Custom batch sampler that ensures groups of num_frames consecutive samples 
-    come from the same scene/dataset. Each batch contains multiple such groups.
-    """
-    def __init__(self, datasets, batch_size, num_frames=4, shuffle=True):
-        self.batch_size = batch_size
-        self.num_frames = num_frames
-        self.shuffle = shuffle
-        
-        # Create indices grouped by dataset
-        self.dataset_indices = []
-        current_offset = 0
-        for dataset in datasets:
-            dataset_len = len(dataset)
-            # Create indices for this dataset
-            indices = list(range(current_offset, current_offset + dataset_len))
-            self.dataset_indices.append(indices)
-            current_offset += dataset_len
-        
-        # Create groups: each group contains num_frames consecutive samples from the same dataset
-        self.groups = []
-        for dataset_idx_list in self.dataset_indices:
-            if len(dataset_idx_list) < num_frames:
-                continue  # Skip datasets with fewer than num_frames images
-            
-            # Group consecutive indices into groups of num_frames
-            for i in range(0, len(dataset_idx_list) - num_frames + 1, num_frames):
-                group = dataset_idx_list[i:i + num_frames]
-                if len(group) == num_frames:
-                    self.groups.append(group)
-            
-            # If there are remaining samples, create a group with the last num_frames
-            if len(dataset_idx_list) >= num_frames:
-                remaining = len(dataset_idx_list) % num_frames
-                if remaining > 0:
-                    # Use the last num_frames samples
-                    group = dataset_idx_list[-num_frames:]
-                    self.groups.append(group)
-        
-        # Create batches by combining groups (each batch should be multiple of num_frames)
-        num_groups_per_batch = batch_size // num_frames
-        self.batches = []
-        for i in range(0, len(self.groups), num_groups_per_batch):
-            batch = []
-            for j in range(i, min(i + num_groups_per_batch, len(self.groups))):
-                batch.extend(self.groups[j])
-            if len(batch) == batch_size:
-                self.batches.append(batch)
-        
-        self.num_batches = len(self.batches)
-    
-    def __iter__(self):
-        if self.shuffle:
-            # Shuffle batches, but keep samples within each group in order
-            batches = self.batches.copy()
-            random.shuffle(batches)
-            for batch in batches:
-                yield batch
-        else:
-            for batch in self.batches:
-                yield batch
-    
-    def __len__(self):
-        return self.num_batches
-
-
-def create_dataloader_non_distributed(name_im_gt_list, my_transforms=[], batch_size=1, num_frames=4):
-    """
-    Create a dataloader without distributed sampling (for single-GPU training).
-    Ensures that groups of num_frames consecutive samples come from the same scene.
-    """
-    
-    if len(name_im_gt_list) == 0:
-        return None, None
-    
-    num_workers_ = 1
-    if batch_size > 1:
-        num_workers_ = 2
-    if batch_size > 4:
-        num_workers_ = 4
-    if batch_size > 8:
-        num_workers_ = 8
-    
-    gos_datasets = []
-    for i in range(len(name_im_gt_list)):
-        gos_dataset = OnlineDataset([name_im_gt_list[i]], transform=transforms.Compose(my_transforms))
-        gos_datasets.append(gos_dataset)
-    
-    gos_dataset = ConcatDataset(gos_datasets)
-    
-    # Create custom batch sampler that groups by scene
-    batch_sampler = SceneGroupedBatchSampler(
-        gos_datasets, 
-        batch_size=batch_size, 
-        num_frames=num_frames, 
-        shuffle=True
-    )
-    
-    dataloader = DataLoader(
-        gos_dataset, 
-        batch_sampler=batch_sampler,
-        num_workers=num_workers_
-    )
-    
-    return dataloader, gos_dataset
 
 
 def train_sam_vggt(
@@ -149,6 +42,7 @@ def train_sam_vggt(
     )
     model.train()
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    best_loss = float("inf")
 
     for epoch in range(epochs):
         running_loss = 0
@@ -167,6 +61,7 @@ def train_sam_vggt(
             valid_ids_list = data["valid_ids"]       # list of B tensors, e.g. [tensor([3,10,...]), ...]
 
             B, N, _, H, W = images.shape
+            print(f"B: {B}, N: {N}, H: {H}, W: {W}")
             assert N == num_frames
 
             # ------------------------------------------------------------------
@@ -263,18 +158,20 @@ def train_sam_vggt(
             #  Build target masks for loss
             # ------------------------------------------------------------------
             target_masks = mask_cat.unsqueeze(1).to(device)   # [B,1,H,W*N]
-            # print(f"low_res_masks shape: {low_res_masks.shape}")
+            # print(f"target_masks shape: {target_masks.shape}")
             pred_masks = low_res_masks[:, 0:1]
-
+            num_masks = float(pred_masks.shape[0])
             # ------------------------------------------------------------------
             #  Loss
             # ------------------------------------------------------------------
             loss_mask, loss_dice = loss_masks(
-                pred_masks.float(),
-                target_masks.float(),
-                num_masks=1.0,
+                pred_masks.float(), target_masks.float(),
+                num_masks=1.0, debug=True,
+                ce_mode="dense",
+                use_pos_weight=False,
+                dense_ce_on="src",
             )
-            loss = loss_mask + loss_dice
+            loss = loss_mask + 5.0 * loss_dice
             wandb.log({
                 "loss/total": loss.item(),
                 "loss/mask": loss_mask.item(),
@@ -341,7 +238,7 @@ def main():
     train_loader = create_dataloader(
         root_dir="./hypersim",
         batch_size=1,
-        num_frames=8,
+        num_frames=4,
         my_transforms=[
             Resize(size=[1024,1024]),
         ]
@@ -384,7 +281,7 @@ def main():
 
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=3e-3, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(trainable_params, lr=3e-2, weight_decay=0.0)
     # optimizer = None
     # 5. Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -397,7 +294,7 @@ def main():
         train_dataloader=train_loader,
         optimizer=optimizer,
         device=device,
-        num_frames=8,  # Number of continuous images per batch
+        num_frames=1,  # Number of continuous images per batch
         epochs=100,  # Number of epochs to train
         amp=False  # Use mixed precision
     )

@@ -15,6 +15,8 @@ from utils.loss_mask import loss_masks
 from utils.misc import sample_points_for_instances
 from torch.utils.data import DataLoader
 from utils.dataloader import MultiSceneImageDataset, SceneBatchSampler, RandomHFlip, Resize, multiview_collate
+from functools import partial
+
 def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
 
     dataset = MultiSceneImageDataset(
@@ -28,10 +30,13 @@ def create_dataloader(root_dir, batch_size=4, num_frames=8, my_transforms=[]):
         num_frames=num_frames
     )
 
+    # Create a partial collate function with num_frames pre-filled
+    collate_fn = partial(multiview_collate, num_frames=num_frames)
+
     loader = DataLoader(
         dataset,
         batch_sampler=sampler,
-        collate_fn=multiview_collate,
+        collate_fn=collate_fn,
         num_workers=4,
     )
     return loader
