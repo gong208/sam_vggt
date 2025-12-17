@@ -425,9 +425,7 @@ class SamVGGT(nn.Module):
         # Prepare constant dense PE once
         dense_pe_1 = self.sam.prompt_encoder.get_dense_pe()  # [1,256,64,64]
 
-        # ============================================================
-        # 6) BATCHIFIED prompt encoding
-        # ============================================================
+
         batch_points_tuple = None
         if point_coords_list is not None:
             # Convert lists → tensors
@@ -445,33 +443,23 @@ class SamVGGT(nn.Module):
         B, Np, _ = sparse_e.shape    # after prompt encoder
         # print("B: ", B)
         # print("Np: ", Np)
-        # ============================================================
-        # 7) TILE dense embeddings and PE across frames (batched)
-        # ============================================================
+
         dense_e_cat = dense_e.repeat(1, 1, 1, N)        # [B,256,64,64N]
         dense_pe_cat = dense_pe_1.repeat(B, 1, 1, N)    # [B,256,64,64N]
 
-        # ============================================================
-        # 8) Flatten embeddings across frames for SAM decoder
-        # ============================================================
+
         concat_embed_bn = torch.cat([fused_bn[:, i] for i in range(N)], dim=3)
-        # ============================================================
-        # 9) Batchify frame indices
-        # ============================================================
+
         prompt_frame_idx = torch.stack(point_frame_indices_list, dim=0).to(self.device)  # [B,N_real]
 
-        # ============================================================
-        # 10) Fuse prompts (batched)
-        # ============================================================
+
         fused_prompts = self.fuse_prompts(
             sam_sparse=sparse_e,          # [B,Np,256]
             vggt_cam=cam_tokens_bn,       # [B,N,9]
             prompt_frame_idx=prompt_frame_idx
         )                                 # [B,Np,256]
 
-        # ============================================================
-        # 11) Decode in batch
-        # ============================================================
+
         low_res_masks_bn, iou_pred_bn = self.sam.mask_decoder(
             image_embeddings=concat_embed_bn,     # [B,256,64,64N]
             image_pe=dense_pe_cat,               # [B,256,64,64N]
@@ -486,9 +474,7 @@ class SamVGGT(nn.Module):
             "vggt_feats": vggt_feats_bn,
         }
         if visualize:
-        # ============================================================
-        # 12) Postprocess per sample (only step requiring loop)
-        # ============================================================
+
 
             masks_b = self.sam.postprocess_masks(
                 low_res_masks_bn,
